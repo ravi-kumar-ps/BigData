@@ -1,0 +1,599 @@
+import os
+import re
+import json
+import sys
+import urllib2
+import logging
+from airflow import DAG
+from airflow.operators.python_operator import (PythonOperator, BranchPythonOperator)
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.sensors import (TimeDeltaSensor, TimeSensor)
+from airflow.operators.email_operator import EmailOperator
+from airflow.operators.dagrun_operator import TriggerDagRunOperator
+from datetime import datetime, timedelta, time
+from collections import OrderedDict
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "")))
+import rpi_utils as utils
+
+log = logging.getLogger(__name__)
+
+
+config = json.load(open(os.path.abspath(
+    os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, os.pardir, "config/rpi/ranking_config.json"))),
+    object_pairs_hook=OrderedDict)
+
+dag = DAG('Prod_Rpi_Input_Click_Conversion_Data_Preparation_Dag',
+          description='Prod Rpi Click Conversion Data Preparation Workflow',
+          schedule_interval="30 09 * * *",
+          start_date=datetime(2020, 03, 01), catchup=False, default_args=config["airflow_config"]["default_args"])
+
+DAG_CONFIG_BUCKET_URL = "http://localhost:8800/buckets/search-spyder-dag-config"
+
+
+def fetch_config_bucket(config_url):
+    content = urllib2.urlopen(config_url).read()
+    content_json = json.loads(content)
+    return content_json["keys"]
+
+
+def prepare_config(**kwargs):
+    config = json.load(open(os.path.abspath(
+        os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, os.pardir,
+                     "config/rpi/ranking_config.json"))), object_pairs_hook=OrderedDict)
+    temp_conf = str(config)
+
+    datestring = kwargs["execution_date"].strftime("%Y-%m-%d")
+    bucket_data = fetch_config_bucket(DAG_CONFIG_BUCKET_URL)
+
+    jar_name = bucket_data[config["RPI_config_Level_0"]["config_bucket_key_sparkjobs"]].split(":")[1].strip()
+    config_bucket = bucket_data["prod_rpi_bucket"].strip()
+    run_mode = bucket_data["fast_rpi_run_mode"].strip()
+
+    temp_conf = temp_conf.replace("${config_bucket}", config_bucket)
+    temp_conf = temp_conf.replace("${run_mode}", run_mode)
+    temp_conf = temp_conf.replace("${date}", datestring)
+    temp_conf = temp_conf.replace("${numOfDays}", "30")
+
+    pincode_bz_mapping_end_point = bucket_data["pincode_bz_mapping_end_point"]
+    temp_conf = temp_conf.replace("${pincode_bz_mapping_end_point}", pincode_bz_mapping_end_point)
+
+    index = 0
+    for key in config.keys():
+        if str(index) in key and index < 2:
+            for k in config[key].keys():
+                replace_string = "${" + k + "}"
+                temp_conf = temp_conf.replace(replace_string, config[key][k])
+                config = eval(temp_conf)
+            index += 1
+    kwargs["task_instance"].xcom_push(key="ranking_config", value=config)
+    kwargs["task_instance"].xcom_push(key="datestring", value=datestring)
+    kwargs["task_instance"].xcom_push(key="jar_name", value=jar_name)
+
+
+def runSparkCommand(**kwargs):
+    config = kwargs["task_instance"].xcom_pull(task_ids="PrepareDAGRun", key="ranking_config")
+    jar_name = kwargs["task_instance"].xcom_pull(task_ids="PrepareDAGRun", key="jar_name")
+    job_name = kwargs["params"]["key_name"]
+    args = config["RPI_config_Level_2"][job_name]
+    jar_location = args["jar_location"] + "/" + jar_name
+    bucket_data = fetch_config_bucket(DAG_CONFIG_BUCKET_URL)
+    queue = bucket_data["rpi_spark_queue"]
+    log.info("Running spark submit with jar %s" % jar_location)
+    cmd = "sudo -u fk-hadoop-search /grid/1/search/search-data/spark-2.3.0-bin-hadoop2.7/bin/spark-submit " \
+          "--name {job_name} " \
+          "--class com.flipkart.search.matrix.ranking.sparkjobs.common.SparkJobRunner " \
+          "--master yarn --queue {queue} --executor-memory {executor_memory}  " \
+          "--conf spark.yarn.executor.memoryOverhead={memory_overhead} " \
+          "--conf spark.worker.cleanup.enabled=false " \
+          "--conf spark.eventLog.enabled=true --conf spark.local.dir=/grid/1/tmp " \
+          "--conf spark.dynamicAllocation.enabled=true " \
+          "--conf spark.shuffle.service.enabled=true " \
+          "--conf spark.dynamicAllocation.minExecutors={min_executors} " \
+          "--conf spark.dynamicAllocation.maxExecutors={max_executors} " \
+          "--executor-cores {executor_cores} --driver-memory {driver_memory} " \
+          "--conf spark.memory.fraction=0.8 --conf spark.memory.storageFraction=0.1 " \
+          "--conf spark.sql.shuffle.partitions={shuffle_partitions} " \
+          "{extra_spark_configs} " \
+          " {jar_location}"
+    cmd = cmd.format(
+        job_name=job_name,
+        queue=queue,
+        executor_memory=args["executor-memory"],
+        executor_cores=args["executor-cores"],
+        driver_memory=args["driver-memory"],
+        min_executors=args["min-executors"],
+        max_executors=args["max-executors"],
+        shuffle_partitions=args.get("shuffle-partitions", "200"),
+        memory_overhead=args.get("memory-overhead", "1G"),
+        extra_spark_configs=utils.get_spark_extra_configs(args.get("extra_spark_args", {})),
+        jar_location=jar_location
+    )
+
+    arguments = args['arguments']
+    main_cmd = cmd + ' ' + ' '.join(arguments)
+    utils.run_shell_cmd(main_cmd)
+
+
+def runStandAloneAppCommand(**kwargs):
+    config = kwargs["task_instance"].xcom_pull(task_ids="PrepareDAGRun", key="ranking_config")
+    jar_name = kwargs["task_instance"].xcom_pull(task_ids="PrepareDAGRun", key="jar_name")
+    args = config["RPI_config_Level_2"][kwargs["params"]["key_name"]]
+    jar_location = args["jar_location"] + "/" + jar_name
+    main_class = args["main.class.name"]
+    cmd = "java -cp {jar_location} {main_class}"
+    cmd = cmd.format(
+        jar_location=jar_location,
+        main_class=main_class
+    )
+    arguments = args['arguments']
+    main_cmd = cmd + ' ' + ' '.join(arguments)
+    log.info("Running stand-alone job with jar %s" % jar_location)
+    utils.run_shell_cmd(main_cmd)
+
+
+def copyPincodesFromHdfsToLocal(**kwargs):
+    config = kwargs["task_instance"].xcom_pull(task_ids="PrepareDAGRun", key="ranking_config")
+    args = config["RPI_config_Level_2"][kwargs["params"]["key_name"]]
+    metadata_pincodes_hdfs_path = args["metadata.pincodes.hdfs.path"]
+    metadata_pincodes_local_path = args["metadata.pincodes.local.path"]
+    cmd_clear_path = "rm -rf " + metadata_pincodes_local_path
+    cmd_create_path = "mkdir -p " + metadata_pincodes_local_path
+    cmd_copy_to_local = "hdfs dfs -copyToLocal " + metadata_pincodes_hdfs_path + " " + metadata_pincodes_local_path
+    utils.run_shell_cmd(cmd_clear_path)
+    utils.run_shell_cmd(cmd_create_path)
+    utils.run_shell_cmd(cmd_copy_to_local)
+
+
+def copyPincodesBZMappingFromLocalToHdfs(**kwargs):
+    config = kwargs["task_instance"].xcom_pull(task_ids="PrepareDAGRun", key="ranking_config")
+    args = config["RPI_config_Level_2"][kwargs["params"]["key_name"]]
+    metadata_pincode_bz_local_path = args["metadata.pincodeBusinessZone.local.path"]
+    metadata_pincode_bz_hdfs_path = args["metadata.pincodeBusinessZone.hdfs.path"]
+    cmd_clear_path = "hdfs dfs -rm -f " + metadata_pincode_bz_hdfs_path
+    cmd_copy_to_hdfs = "hdfs dfs -put " + metadata_pincode_bz_local_path + " " + metadata_pincode_bz_hdfs_path
+    utils.run_shell_cmd(cmd_clear_path)
+    utils.run_shell_cmd(cmd_copy_to_hdfs)
+
+
+def get_data_path_availability_ratio(**kwargs):
+    ti = kwargs['task_instance']
+    date_string = ti.xcom_pull(task_ids='PrepareDAGRun', key='datestring')
+    current_date = datetime.strptime(date_string, "%Y-%m-%d")
+    next_date = current_date + timedelta(days=1)
+    current_date_string = current_date.strftime("%Y/%m/%d")
+    next_date_string = next_date.strftime("%Y/%m/%d")
+
+    log.info("upstream data path date strings : " + str(current_date_string) + " & " + str(next_date_string))
+
+    bucket_data = fetch_config_bucket(DAG_CONFIG_BUCKET_URL)
+    upstream_data_paths = bucket_data["click_conversion_data_path_list"]
+    total_data_paths = len(upstream_data_paths)
+    available_data_paths = 0
+    for upstream_data_path in upstream_data_paths:
+        upstream_data_path = upstream_data_path.replace("${date}", current_date_string).replace("${nextDate}",
+                                                                                                next_date_string)
+        log.info("upstream data current run path to be checked: " + str(upstream_data_path))
+        available_data_paths += int(utils.check_paths_in_gcs([upstream_data_path]))
+
+    availability_ratio = int(float(available_data_paths) / float(total_data_paths) * 100)
+    return availability_ratio
+
+
+def check_upstream_data_availability(**kwargs):
+    # if last retry, then pass the flow to next step.
+    ti = kwargs['task_instance']
+    if ti.try_number == (ti.task.retries + 1):
+        log.info("Last Retry")
+        return
+
+    bucket_data = fetch_config_bucket(DAG_CONFIG_BUCKET_URL)
+    threshold_ratio = bucket_data.get("min_data_percent_available_threshold", 75)
+    max_threshold_ratio = bucket_data.get("max_data_percent_available_threshold", 100)
+    if ti.try_number <= 6:  # because each retry is of 10 minutes
+        threshold_ratio = max_threshold_ratio  # we will check for 100% data availability till 1 PM only.
+
+    availability_ratio = get_data_path_availability_ratio(**kwargs)
+    log.info("Upstream Click Conversion Data Availability ratio : " + str(availability_ratio))
+    if availability_ratio >= threshold_ratio:
+        log.info("Enough Upstream Click Conversion Data is generated successfully. Going Ahead")
+        return
+    else:
+        raise ValueError("{0}% Upstream Click Conversion Data is still Not Prepared. Check with Upstream Team".format(threshold_ratio))
+
+
+def back_filling_check_for_data_availability(**kwargs):
+    availability_ratio = get_data_path_availability_ratio(**kwargs)
+    log.info("Upstream Click Conversion Data Availability ratio : " + str(availability_ratio))
+    if availability_ratio == 100:
+        log.info("Enough Upstream Click Conversion Data is generated successfully. Going Ahead")
+        return
+    else:
+        raise ValueError("Upstream Click Conversion Data is still Not Prepared. Check with Upstream Team")
+
+
+def back_fill_tasks(**kwargs):
+    log.info("Backfilling Tasks started")
+    base_dag = dag
+    log.info("base Dag found :" + str(base_dag))
+
+    bucket_data = fetch_config_bucket(DAG_CONFIG_BUCKET_URL)
+    # reading array type because nested keys are not supported
+    back_filling_tasks_with_key_name = bucket_data["back_filling_tasks_with_key_name"][0]
+
+    regex_list = [r"^{0}$".format(task_id) for task_id in back_filling_tasks_with_key_name.keys()]
+    all_tasks_regex = re.compile('|'.join(regex_list))
+
+    sub_dag = base_dag.sub_dag(
+        task_regex=all_tasks_regex,
+        include_downstream=False,
+        include_upstream=False
+    )
+
+    log.info("sub dag found : " + str(sub_dag))
+    sorted_task_list = [task.task_id for task in sub_dag.topological_sort()]
+    log.info("sorted task list : " + str(sorted_task_list))
+
+    for back_fill_task in sorted_task_list:
+        log.info("Starting backfilling task : " + str(back_fill_task))
+        kwargs["params"]["key_name"] = back_filling_tasks_with_key_name[back_fill_task]
+        runSparkCommand(**kwargs)
+        log.info("{0} is backfilled successfully, continuing to next task....".format(back_fill_task))
+
+
+def decide_normal_flow_or_back_filling_flow(**kwargs):
+    availability_ratio = get_data_path_availability_ratio(**kwargs)
+    log.info("Availability Ratio as of now is : " + str(availability_ratio))
+    log.info("Flow will be decided accordingly.....")
+    if availability_ratio == 100:
+        return 'NormalFlowFor100PercentData'
+    elif availability_ratio == 75:
+        return 'NormalAndBackFillingFlowFor75PercentData'
+    else:
+        return 'BackFillingFlowForLessData'
+
+
+def passing_execution_date_to_external_dag(context, dag_run_obj):
+    execution_date = context["execution_date"]
+    dag_run_obj.payload = {"execution_date": execution_date}
+    return dag_run_obj
+
+prepare_run_task = PythonOperator(dag=dag, task_id='PrepareDAGRun', python_callable=prepare_config,
+                                  provide_context=True)
+
+check_upstream_click_conversion_data_availability = PythonOperator(
+    task_id='CheckUpstreamClickConversionDataAvailability',
+    dag=dag, provide_context=True,
+    python_callable=check_upstream_data_availability,
+    retries=48, retry_delay=timedelta(minutes=5), email_on_retry=False
+)
+
+normal_flow_or_back_filling_flow = BranchPythonOperator(
+    task_id='NormalFlowOrBackFillingFlow',
+    dag=dag,
+    provide_context=True,
+    python_callable=decide_normal_flow_or_back_filling_flow
+)
+
+normal_flow_for_100_percent_data = DummyOperator(
+    task_id='NormalFlowFor100PercentData',
+    dag=dag
+)
+
+normal_and_back_filling_flow_for_75_percent_data = DummyOperator(
+    task_id='NormalAndBackFillingFlowFor75PercentData',
+    dag=dag
+)
+
+back_filling_flow_for_less_data = DummyOperator(
+    task_id='BackFillingFlowForLessData',
+    dag=dag
+)
+
+back_filling_flow_start = DummyOperator(
+    task_id='BackFillingFlowStart',
+    dag=dag,
+    trigger_rule="one_success"
+)
+
+back_filling_mandatory_sleep_time = TimeSensor(
+    task_id='BackFillingMandatorySleepTimer',
+    dag=dag,
+    target_time=time(hour=20),
+    timeout=10,
+    poke_interval=2,
+    retry_delay=timedelta(minutes=30),
+    retries=20,
+    email_on_retry=False
+)
+
+back_filling_check_for_100_percent_data_availability = PythonOperator(
+    task_id='BackFillingCheck100PercentDataAvailability',
+    dag=dag,
+    provide_context=True,
+    python_callable=back_filling_check_for_data_availability,
+    retries=36, retry_delay=timedelta(hours=2), email_on_retry=False
+)
+
+back_fill_defined_tasks = PythonOperator(
+    task_id='BackFillTasks',
+    dag=dag,
+    provide_context=True,
+    python_callable=back_fill_tasks
+)
+
+complete_data_consumed = EmailOperator(
+    to='search-ranking-notifications@flipkart.com',
+    task_id='CompleteDataConsumed',
+    provide_context=True,
+    subject='Complete Data is Consumed In RPI Input Preparation Dag - {{ti.xcom_pull(task_ids=\"PrepareDAGRun\", key=\"datestring\")}}',
+    html_content="It is consumed either through normal flow, or later on back filled.",
+    dag=dag
+)
+
+
+rpi_data_preparation_click_conversion_data_daily_filtering_task = PythonOperator(
+    task_id='RpiDataPreparationClickConversionDataDailyFilter',
+    dag=dag, provide_context=True,
+    python_callable=runSparkCommand,
+    params={'key_name': 'rpi_data_preparation_click_conversion_data_daily_filtering'},
+    trigger_rule="one_success"
+)
+
+avg_fsp_fsn_daily_task = PythonOperator(
+    task_id='AvgFspFsnDaily',
+    dag=dag, provide_context=True,
+    python_callable=runSparkCommand,
+    params={'key_name': 'avg_fsp_fsn_daily'}
+)
+
+last_served_avg_fsp_of_30_days_fsn_task = PythonOperator(
+    task_id='LastServedAvgFspOf30DaysFsn',
+    dag=dag, provide_context=True,
+    python_callable=runSparkCommand,
+    params={'key_name': 'last_served_avg_fsp_of_30_days_fsn'}
+)
+
+rpi_data_preparation_click_conversion_data_daily_aggregation_task = PythonOperator(
+    task_id='RpiDataPreparationClickConversionDataDailyAggregation',
+    dag=dag, provide_context=True,
+    python_callable=runSparkCommand,
+    params={'key_name': 'rpi_data_preparation_click_conversion_data_daily_aggregation'}
+)
+
+rpi_data_preparation_click_conversion_data_monthly_aggregation_task = PythonOperator(
+    task_id='RpiDataPreparationClickConversionDataMonthlyAggregation',
+    dag=dag, provide_context=True,
+    python_callable=runSparkCommand,
+    params={'key_name': 'rpi_data_preparation_click_conversion_data_monthly_aggregation'}
+)
+
+pos_ctr_bias_monthly_normalized_clicks = PythonOperator(
+    task_id='PosCTRBiasMonthlyNormalizedClicks',
+    dag=dag, provide_context=True,
+    python_callable=runSparkCommand,
+    params={'key_name': 'pos_ctr_bias_monthly_normalized_clicks'}
+)
+
+geo_daily_aggregation_task = PythonOperator(
+    task_id='GeoDailyAggregation',
+    dag=dag, provide_context=True,
+    python_callable=runSparkCommand,
+    params={'key_name': 'geo_daily_aggregation_task'}
+)
+
+geo_multiDay_aggregation_task = PythonOperator(
+    task_id='GeoMultiDayAggregation',
+    dag=dag, provide_context=True,
+    python_callable=runSparkCommand,
+    params={'key_name': 'geo_multiDay_aggregation_task'}
+)
+
+geo_grocery_daily_aggregation_task = PythonOperator(
+    task_id='GeoGroceryDailyAggregation',
+    dag=dag, provide_context=True,
+    python_callable=runSparkCommand,
+    params={'key_name': 'geo_grocery_daily_aggregation_task'}
+)
+
+geo_grocery_multiDay_aggregation_task = PythonOperator(
+    task_id='GeoGroceryMultiDayAggregation',
+    dag=dag, provide_context=True,
+    python_callable=runSparkCommand,
+    params={'key_name': 'geo_grocery_multiDay_aggregation_task'}
+)
+
+geo_ranking_pipeline_trigger = TriggerDagRunOperator(
+    task_id='GeoRankingPipelineTrigger',
+    trigger_dag_id='Geo_ranking_dag',
+    reset_dag_run=True,
+    provide_context=True,
+    python_callable= passing_execution_date_to_external_dag,
+    dag=dag
+)
+
+geo_grocery_oms_data_generation_task = PythonOperator(
+    task_id='GeoGroceryOmsDataGeneration',
+    dag=dag, provide_context=True,
+    python_callable=runSparkCommand,
+    params={'key_name': 'geo_grocery_oms_data_generation_task'}
+)
+
+pincode_bz_mapper_task = PythonOperator(
+    task_id='PincodeBusinessZoneMapper',
+    dag=dag, provide_context=True,
+    python_callable=runStandAloneAppCommand,
+    params={'key_name': 'pincode_bz_mapper_task'}
+)
+
+copyPincodesFromHdfsToLocal = PythonOperator(
+    task_id='CopyPincodesFromHdfsToLocal',
+    dag=dag, provide_context=True,
+    python_callable=copyPincodesFromHdfsToLocal,
+    params={'key_name': 'pincode_bz_hdfs_local_transfer'}
+)
+
+copyPincodesBZMappingFromLocalToHdfs = PythonOperator(
+    task_id='CopyPincodesBZMappingFromLocalToHdfs',
+    dag=dag, provide_context=True,
+    python_callable=copyPincodesBZMappingFromLocalToHdfs,
+    params={'key_name': 'pincode_bz_hdfs_local_transfer'}
+)
+
+# Affluence Ranking Tasks
+# TODO : Separate Multi Day Decay tasks and Signal preparator tasks into specialised DAG
+# TODO : Convert Geo_ranking_dag into more generic Cohort_Ranking_DAG and move these tasks
+# TODO : Need to do above changes before GO - Live after AB
+
+affluence_ranking_fetch_uie_data = PythonOperator(
+    task_id='AffluenceRankingFetchUieData', dag=dag,
+    provide_context=True,
+    python_callable=runSparkCommand,
+    params={'key_name': 'affluence_ranking_fetch_uie_data'}
+)
+
+affluence_ranking_daily_aggregation = PythonOperator(
+    task_id='AffluenceRankingDailyAggregation', dag=dag,
+    provide_context=True,
+    python_callable=runSparkCommand,
+    params={'key_name': 'affluence_ranking_daily_aggregation'}
+)
+
+affluence_ranking_v2_daily_aggregation = PythonOperator(
+    task_id='AffluenceRankingV2DailyAggregation', dag=dag,
+    provide_context=True,
+    python_callable=runSparkCommand,
+    params={'key_name': 'affluence_ranking_daily_aggregation_v2'}
+)
+
+# Old Store Path Preparation Dag Tasks
+
+get_all_store_paths = "sudo rm -rf /grid/1/search-data-spyder/bin/airflow/scripts/rpi/StorePathsList.txt && " \
+                      "sudo /home/airflow/airflow_venv/bin/python /grid/1/search-data-spyder/bin/airflow/scripts/rpi/getAllStorePaths.py"
+
+get_all_store_paths_api_ = BashOperator(
+    task_id='GetAllStorePathsAPI',
+    provide_context=True,
+    bash_command=get_all_store_paths,
+    dag=dag, trigger_rule="all_success"
+)
+
+copy_stores_file = "hdfs dfs -rm -r {{params.hdfsStorePaths}} && " \
+                   "hdfs dfs -copyFromLocal {{params.localStorePaths}} {{params.hdfsStorePaths}}"
+
+copy_all_stores_file = BashOperator(
+    task_id='CopyAllStoresPathFile',
+    provide_context=True,
+    bash_command=copy_stores_file, dag=dag,
+    trigger_rule="all_success",
+    params={
+        "localStorePaths": config["local_counter_file_path"]["allStorePaths"],
+        "hdfsStorePaths": config["counter_file"]["allStorePaths"]
+    }
+)
+
+conversion_click_daily_agg = PythonOperator(
+    task_id='ConversionClickDailyAgg', dag=dag,
+    provide_context=True,
+    python_callable=runSparkCommand,
+    params={'key_name': 'conversion-click-daily-agg'}
+)
+
+conversion_click_monthly_agg = PythonOperator(
+    task_id='ConversionClickMonthlyAgg', dag=dag,
+    provide_context=True,
+    python_callable=runSparkCommand,
+    params={'key_name': 'conversion-click-monthly-agg'}
+)
+
+fsn_primary_storepath_computer = PythonOperator(
+    task_id='FsnPrimaryStorePathComputer', dag=dag,
+    provide_context=True,
+    python_callable=runSparkCommand,
+    params={'key_name': 'fsn-primary-storepath-computer'}
+)
+
+fsn_primary_storepath_rollup = PythonOperator(
+    task_id='FsnPrimaryStorePathRollUp', dag=dag,
+    provide_context=True,
+    python_callable=runSparkCommand,
+    params={'key_name': 'fsn-primary-storepath-rollup'}
+)
+
+join_fsn_primary_storepath_rollup_rpi_product_path = PythonOperator(
+    task_id='JoinFsnPrimaryStoreAndRPIProductPath', dag=dag,
+    provide_context=True,
+    python_callable=runSparkCommand,
+    params={'key_name': 'join-fsn-primary-storepath-rollup-rpi-productpath'},
+    retries=5, retry_delay=timedelta(seconds=1800),
+    email_on_retry=False, email_on_failure=True
+)
+
+prepare_common_cms_data = PythonOperator(
+    task_id='PrepareCommonCMSData', dag=dag,
+    provide_context=True,
+    python_callable=runSparkCommand,
+    params={'key_name': 'prepare-common-cms-data'},
+    retries=5, retry_delay=timedelta(seconds=1800),
+    email_on_retry=False, email_on_failure=True
+)
+
+click_conversion_tasks_finished = DummyOperator(
+    task_id='ClickConversionTasksFinished',
+    dag=dag
+)
+
+TriggerRpiReport = TriggerDagRunOperator(task_id='TriggerRpiReport', trigger_dag_id="rpi_input_report_generation_dag", python_callable=passing_execution_date_to_external_dag, dag=dag, provide_context=True)
+
+
+prepare_run_task >> check_upstream_click_conversion_data_availability >> normal_flow_or_back_filling_flow
+
+# decide which flow to follow based on data availability.
+normal_flow_or_back_filling_flow >> normal_flow_for_100_percent_data >> rpi_data_preparation_click_conversion_data_daily_filtering_task
+normal_flow_or_back_filling_flow >> normal_and_back_filling_flow_for_75_percent_data
+normal_flow_or_back_filling_flow >> back_filling_flow_for_less_data >> back_filling_flow_start
+
+normal_and_back_filling_flow_for_75_percent_data >> rpi_data_preparation_click_conversion_data_daily_filtering_task
+normal_and_back_filling_flow_for_75_percent_data >> back_filling_flow_start
+# data availability flow decision ends.
+
+# back filling tasks start
+back_filling_flow_start >> back_filling_mandatory_sleep_time >> back_filling_check_for_100_percent_data_availability >> back_fill_defined_tasks >> complete_data_consumed
+# back filling tasks ends.
+
+prepare_run_task >> copyPincodesFromHdfsToLocal >> pincode_bz_mapper_task >> copyPincodesBZMappingFromLocalToHdfs
+
+prepare_run_task >> geo_grocery_oms_data_generation_task
+
+rpi_data_preparation_click_conversion_data_daily_filtering_task >> avg_fsp_fsn_daily_task >> last_served_avg_fsp_of_30_days_fsn_task
+
+rpi_data_preparation_click_conversion_data_daily_filtering_task >> geo_grocery_daily_aggregation_task
+copyPincodesBZMappingFromLocalToHdfs >> geo_grocery_daily_aggregation_task
+geo_grocery_oms_data_generation_task >> geo_grocery_daily_aggregation_task
+geo_grocery_daily_aggregation_task >> geo_grocery_multiDay_aggregation_task
+
+rpi_data_preparation_click_conversion_data_daily_filtering_task >> rpi_data_preparation_click_conversion_data_daily_aggregation_task
+
+rpi_data_preparation_click_conversion_data_daily_filtering_task >> geo_daily_aggregation_task >> geo_multiDay_aggregation_task >> geo_ranking_pipeline_trigger
+
+rpi_data_preparation_click_conversion_data_daily_aggregation_task >> rpi_data_preparation_click_conversion_data_monthly_aggregation_task
+rpi_data_preparation_click_conversion_data_daily_aggregation_task >> pos_ctr_bias_monthly_normalized_clicks
+
+# Old Store Path Preparation Dag Dependencies
+
+prepare_run_task >> conversion_click_daily_agg >> conversion_click_monthly_agg >> fsn_primary_storepath_computer
+prepare_run_task >> get_all_store_paths_api_ >> copy_all_stores_file >> fsn_primary_storepath_computer
+fsn_primary_storepath_computer >> fsn_primary_storepath_rollup >> join_fsn_primary_storepath_rollup_rpi_product_path >> prepare_common_cms_data
+
+# dummy completion task dependencies
+prepare_common_cms_data >> click_conversion_tasks_finished
+pos_ctr_bias_monthly_normalized_clicks >> click_conversion_tasks_finished
+rpi_data_preparation_click_conversion_data_monthly_aggregation_task >> click_conversion_tasks_finished >> complete_data_consumed
+
+#Trigger External Dag after click_conversion_tasks_finished
+click_conversion_tasks_finished >> TriggerRpiReport
+
+# Affluence Ranking Task Dependencies
+prepare_run_task >> affluence_ranking_fetch_uie_data >> [affluence_ranking_daily_aggregation, affluence_ranking_v2_daily_aggregation]
+rpi_data_preparation_click_conversion_data_daily_filtering_task >> [affluence_ranking_daily_aggregation, affluence_ranking_v2_daily_aggregation]
