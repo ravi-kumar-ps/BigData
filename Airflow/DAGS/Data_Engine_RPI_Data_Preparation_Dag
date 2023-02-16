@@ -1,0 +1,354 @@
+import logging
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.operators.dagrun_operator import TriggerDagRunOperator
+import os
+import json
+import urllib2
+import sys
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "")))
+import common_utils
+
+log = logging.getLogger(__name__)
+
+all_config = json.load(open(os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, os.pardir, "config/spyder/data_config.json"))))
+raw_data_config = all_config["raw_data_config"]
+
+team_name = "SPYDER"
+dag_name = "Data_Engine_RPI_Data_Preparation_Dag"
+dag_description = "This is daily data creation flow for RPI clicks, impressions and sales data"
+application_name = team_name + "_" + dag_name
+application = " --name "  + team_name + "_" + dag_name + "_"
+
+dag = DAG(dag_name, description=dag_description,
+          schedule_interval="0 5 * * *",
+          start_date=datetime(2018, 10, 21), catchup=False, default_args=all_config["airflow_config"]["default_args_ranking"] )
+
+def fetch_jar_and_queue(**context):
+    ti = context["task_instance"]
+    content = urllib2.urlopen("http://api.aso1.cfgsvc-prod.fkcloud.in/v1/buckets/search-spyder-dag-config").read()
+    content_json = json.loads(content)
+    jar_location = content_json["keys"]["spyder"].strip()
+    refactored_jar_location = content_json["keys"]["spyder_refactored"].strip()
+    queue_name = raw_data_config["queue_name"]
+    bucket_name = raw_data_config["spyder_prod_bucket"]
+    spyder_cmd_prefix = all_config["spyder_spark_cmd_prefix"]
+    ti.xcom_push(key="jar_location", value=jar_location)
+    ti.xcom_push(key="refactored_jar_location", value=refactored_jar_location)
+    ti.xcom_push(key="queue_name", value=queue_name)
+    ti.xcom_push(key="bucket_name", value=bucket_name)
+    ti.xcom_push(key="spyder_cmd_prefix", value=spyder_cmd_prefix)
+
+SetJarAndQueue = PythonOperator(task_id='SetJarAndQueue', provide_context=True, python_callable=fetch_jar_and_queue, dag=dag )
+
+rpi_data_job = """
+{{ ti.xcom_pull(task_ids='SetJarAndQueue', key='spyder_cmd_prefix') }} --conf spark.dynamicAllocation.minExecutors={{ params.minExec }} --conf spark.dynamicAllocation.maxExecutors={{ params.maxExec }} --conf spark.dynamicAllocation.initialExecutors={{ params.initialExec }} --conf spark.yarn.maxAppAttempts=1 --queue {{ ti.xcom_pull(task_ids='SetJarAndQueue', key='queue_name') }} {{ params.application_name_tag }}_{{next_execution_date.strftime("%Y-%m-%d_%H_%M")}} --executor-memory {{ params.exec_memory}}  {{ ti.xcom_pull(task_ids='SetJarAndQueue', key='refactored_jar_location') }} configUrl==http://api.aso1.cfgsvc-prod.fkcloud.in/v1/buckets/{{ ti.xcom_pull(task_ids='SetJarAndQueue', key='bucket_name') }} dateString=={{ execution_date.strftime("%Y-%m-%d") }} flowName=={{ params.flow_name }}  dataSource=={{ params.dataset_name }}  numOfDays=={{ params.numDays }}
+"""
+
+def dailyProductPath(**kwargs):
+    ti = kwargs["task_instance"]
+
+    timestamp = kwargs["next_execution_date"].strftime("%Y-%m-%d_%H_%M")
+    application_name_tag = application + kwargs['params']['task_id'] + "_" + timestamp
+
+    dateString = (kwargs["execution_date"]).strftime("%Y-%m-%d")
+    cmd=ti.xcom_pull(task_ids='SetJarAndQueue', key='spyder_cmd_prefix')+" --conf spark.dynamicAllocation.minExecutors="+kwargs['params']['minExec']+" --conf spark.dynamicAllocation.maxExecutors="+kwargs['params']['maxExec']+" --conf spark.dynamicAllocation.initialExecutors="+kwargs['params']['initialExec']+ " --queue " + ti.xcom_pull(task_ids='SetJarAndQueue', key='queue_name') + application_name_tag +" --executor-memory "+ kwargs['params']['exec_memory']+" "+ti.xcom_pull(task_ids='SetJarAndQueue', key='refactored_jar_location')+" configUrl==http://api.aso1.cfgsvc-prod.fkcloud.in/v1/buckets/"+ti.xcom_pull(task_ids='SetJarAndQueue', key='bucket_name') +" flowName==" + kwargs['params']['flowName'] + " currentDate==" + dateString
+    exit_code = common_utils.run_subprocess(cmd)
+    if(exit_code!=0):
+        raise Exception("Process failed")
+
+DailyProductPath = PythonOperator(task_id='DailyProductPath', python_callable=dailyProductPath, provide_context=True, dag=dag, params={
+    'flowName': raw_data_config['product_path_fetch_flow'],
+    "task_id": "DailyProductPath",
+    "minExec": "5",
+    "maxExec": "50",
+    "exec_memory": "20G",
+    "initialExec": "5",
+}, retries=10, retry_delay=timedelta(seconds=900), email_on_retry=False)
+
+def prepareProductPath(**kwargs):
+    ti = kwargs["task_instance"]
+
+    timestamp = kwargs["next_execution_date"].strftime("%Y-%m-%d_%H_%M")
+    application_name_tag = application + kwargs['params']['task_id'] + "_" + timestamp
+
+    dateString = (kwargs["execution_date"] - timedelta(0)).strftime("%Y-%m-%d")
+    cmd = ti.xcom_pull(task_ids='SetJarAndQueue', key='spyder_cmd_prefix')+" --conf spark.dynamicAllocation.minExecutors="+kwargs['params']['minExec']+" --conf spark.dynamicAllocation.maxExecutors="+kwargs['params']['maxExec']+" --conf spark.dynamicAllocation.initialExecutors="+kwargs['params']['initialExec']+" --queue " + ti.xcom_pull(task_ids='SetJarAndQueue', key='queue_name') + application_name_tag +" --executor-memory "+ kwargs['params']['exec_memory'] + " " + ti.xcom_pull(task_ids='SetJarAndQueue', key='refactored_jar_location') + " configUrl==http://api.aso1.cfgsvc-prod.fkcloud.in/v1/buckets/" + ti.xcom_pull(task_ids='SetJarAndQueue', key='bucket_name')  + " flowName==" + kwargs['params']['flowName'] + " numOfDays==30 currentDate==" + dateString
+    common_utils.run_subprocess(cmd)
+
+PrepareProductPath = PythonOperator(task_id='PrepareProductPath', python_callable=prepareProductPath, provide_context=True, dag=dag, params={
+    'flowName': raw_data_config['prepare_product_path'],
+    "task_id": "PrepareProductPath",
+    "initialExec": "5",
+    "minExec": "5",
+    "maxExec": "100",
+    "exec_memory": "8G"
+})
+
+def rpiCount_agg(**kwargs):
+    ti=kwargs["task_instance"]
+
+    timestamp = kwargs["next_execution_date"].strftime("%Y-%m-%d_%H_%M")
+    application_name_tag = application + kwargs['params']['task_id'] + "_" + timestamp
+
+    dateString = (kwargs["execution_date"] - timedelta(1)).strftime("%Y-%m-%d")
+    cmd = ti.xcom_pull(task_ids='SetJarAndQueue', key='spyder_cmd_prefix') + " --conf spark.dynamicAllocation.minExecutors=" + kwargs['params']['minExec'] + " --conf spark.dynamicAllocation.maxExecutors=" + kwargs['params']['maxExec'] + " --conf spark.dynamicAllocation.initialExecutors=" + kwargs['params']['initialExec'] + " --queue " + ti.xcom_pull(task_ids='SetJarAndQueue', key='queue_name') + application_name_tag + " --conf spark.shuffle.service.enabled=" + kwargs['params']['shuffleService'] + " --conf spark.dynamicAllocation.executorIdleTimeout=" + kwargs['params']['executorIdleTimeout'] + " --executor-memory " + kwargs['params']['exec_memory'] + " " + ti.xcom_pull(task_ids='SetJarAndQueue', key='refactored_jar_location') + " configUrl==http://api.aso1.cfgsvc-prod.fkcloud.in/v1/buckets/"+ti.xcom_pull(task_ids='SetJarAndQueue', key='bucket_name') + " flowName==" + kwargs['params']['flowName'] + " currentDate==" + dateString
+    exit_code = common_utils.run_subprocess(cmd)
+    if(exit_code!=0):
+        raise Exception("Process Failed")
+
+RPICountAgg = PythonOperator(task_id = 'RpiCountAgg', python_callable=rpiCount_agg, xcom_push = True, dag=dag,  provide_context=True,
+                             params={
+                                 'flowName': raw_data_config['rpiCount_agg_flow'],
+                                 "task_id": "RpiCountAgg",
+                                 "minExec": "1",
+                                 "maxExec": "10",
+                                 "exec_memory": "5G",
+                                 "initialExec": "1",
+                                 "shuffleService" : "true",
+                                 "executorIdleTimeout" :  "10s"
+                             }, retries=2, retry_delay=timedelta(seconds=900), email_on_retry=False)
+
+def run_job(**kwargs):
+    ti = kwargs["task_instance"]
+
+    timestamp = kwargs["next_execution_date"].strftime("%Y-%m-%d_%H_%M")
+    application_name_tag = application + kwargs['params']['task_id'] + "_" + timestamp
+
+    currDate = kwargs["execution_date"].strftime("%Y-%m-%d")
+    cmd = ti.xcom_pull(task_ids='SetJarAndQueue', key='spyder_cmd_prefix')+" --conf spark.dynamicAllocation.minExecutors="+kwargs['params']['minExec']+" --conf spark.dynamicAllocation.maxExecutors="+kwargs['params']['maxExec']+" --conf spark.dynamicAllocation.initialExecutors="+kwargs['params']['initialExec'] +" --queue " + ti.xcom_pull(task_ids='SetJarAndQueue', key='queue_name') + application_name_tag +" --executor-memory "+ kwargs['params']['exec_memory']+ " " + ti.xcom_pull(task_ids='SetJarAndQueue', key='refactored_jar_location') + " configUrl==http://api.aso1.cfgsvc-prod.fkcloud.in/v1/buckets/" + ti.xcom_pull(task_ids='SetJarAndQueue', key='bucket_name')  + " flowName==" + kwargs['params']['flowName'] + " currentDate==" + currDate
+    exit_code = common_utils.run_subprocess(cmd)
+    if(exit_code!=0):
+        raise Exception("Process Failed")
+
+DailyUniqueFsn = PythonOperator(
+    task_id = 'DailyUniqueFsn',
+    python_callable=run_job,
+    dag=dag,
+    params = {"flowName": raw_data_config["unique-fsn-count"],"initialExec": "5",
+              "task_id": "DailyUniqueFsn",
+              "minExec": "5",
+              "maxExec": "100",
+              "exec_memory": "5G" },
+    xcom_push=True,
+    provide_context=True, retries=3, retry_delay=timedelta(seconds=60), email_on_retry=False)
+
+RpiDailyClicks = BashOperator(
+    task_id = 'RPIClicks',
+    bash_command=rpi_data_job,
+    dag=dag,
+    params = {"numDays": raw_data_config["rpiNumDays"],
+              "application_name_tag" : application + "RPIClicks",
+              "flow_name": raw_data_config["rpi_clicks_preparer_flow_name"],
+              "dataset_name": "rpi",
+              "initialExec": "5",
+              "minExec": "5",
+              "maxExec": "100",
+              "exec_memory": "5G"},
+    xcom_push=True,
+    provide_context=True, retries=1, retry_delay=timedelta(seconds=60), email_on_retry=False)
+
+GroceryDailyClicks = BashOperator(
+    task_id = 'GroceryRPIClicks',
+    bash_command=rpi_data_job,
+    dag=dag,
+    params = {"numDays": raw_data_config["rpiNumDays"],
+              "application_name_tag" : application + "GroceryRPIClicks",
+              "flow_name": raw_data_config["rpi_clicks_preparer_flow_name"],
+              "dataset_name": "rpi_grocery",
+              "initialExec": "5",
+              "minExec": "5",
+              "maxExec": "100",
+              "exec_memory": "8G"},
+    xcom_push=True,
+    provide_context=True )
+
+EmeraldDailyClicks = BashOperator(
+    task_id = '2GudRPIClicks',
+    bash_command=rpi_data_job,
+    dag=dag,
+    params = {"numDays": raw_data_config["rpiNumDays"],
+              "application_name_tag" : application + "2GudRPIClicks",
+              "flow_name": raw_data_config["rpi_clicks_preparer_flow_name"],
+              "dataset_name": "rpi_emerald",
+              "initialExec": "5",
+              "minExec": "5",
+              "maxExec": "100",
+              "exec_memory": "5G"},
+    xcom_push=True,
+    provide_context=True )
+
+HyperlocalDailyClicks = BashOperator(
+    task_id = 'HyperlocalRPIClicks',
+    bash_command=rpi_data_job,
+    dag=dag,
+    params = {"numDays": raw_data_config["hyperlocalNumDays"],
+              "application_name_tag" : application + "HlRPIClicks",
+              "flow_name": raw_data_config["rpi_clicks_preparer_flow_name"],
+              "dataset_name": "rpi_hyperlocal",
+              "initialExec": "5",
+              "minExec": "5",
+              "maxExec": "100",
+              "exec_memory": "5G"},
+    xcom_push=True,
+    provide_context=True )
+
+RpiDailyImpressions = BashOperator(
+    task_id = 'RPIImpressions',
+    bash_command=rpi_data_job,
+    dag=dag,
+    params = {"numDays": raw_data_config["rpiNumDays"],
+              "application_name_tag" : application + "RPIImpressions",
+              "flow_name": raw_data_config["rpi_impressions_preparer_flow_name"],
+              "dataset_name": "rpi",
+              "initialExec": "5",
+              "minExec": "5",
+              "maxExec": "250",
+              "exec_memory": "5G"},
+    xcom_push=True,
+    provide_context=True, retries=1, retry_delay=timedelta(seconds=60), email_on_retry=False)
+
+GroceryDailyImpressions = BashOperator(
+    task_id = 'GroceryRPIImpressions',
+    bash_command=rpi_data_job,
+    dag=dag,
+    params = {"numDays": raw_data_config["rpiNumDays"],
+              "application_name_tag" : application + "GroceryRPIImpressions",
+              "flow_name": raw_data_config["rpi_impressions_preparer_flow_name"],
+              "dataset_name": "rpi_grocery",
+              "initialExec": "5",
+              "minExec": "5",
+              "maxExec": "100",
+              "exec_memory": "8G"},
+    xcom_push=True,
+    provide_context=True )
+
+EmeraldDailyImpressions = BashOperator(
+    task_id = '2GudRPIImpressions',
+    bash_command=rpi_data_job,
+    dag=dag,
+    params = {"numDays": raw_data_config["rpiNumDays"],
+              "application_name_tag" : application + "2GudRPIImpressions",
+              "flow_name": raw_data_config["rpi_impressions_preparer_flow_name"],
+              "dataset_name": "rpi_emerald",
+              "initialExec": "5",
+              "minExec": "5",
+              "maxExec": "100",
+              "exec_memory": "8G"},
+    xcom_push=True,
+    provide_context=True )
+
+HyperlocalDailyImpressions = BashOperator(
+    task_id = 'HyperlocalRPIImpressions',
+    bash_command=rpi_data_job,
+    dag=dag,
+    params = {"numDays": raw_data_config["hyperlocalNumDays"],
+              "application_name_tag" : application + "HlRPIImpressions",
+              "flow_name": raw_data_config["rpi_impressions_preparer_flow_name"],
+              "dataset_name": "rpi_hyperlocal",
+              "initialExec": "5",
+              "minExec": "5",
+              "maxExec": "100",
+              "exec_memory": "5G"},
+    xcom_push=True,
+    provide_context=True )
+
+HyperlocalDailyImpressionsFiltered = BashOperator(
+    task_id = 'HyperlocalRPIImpressionsFiltered',
+    bash_command=rpi_data_job,
+    dag=dag,
+    params = {"numDays": raw_data_config["hyperlocalNumDays"],
+              "application_name_tag" : application + "HlImpressionsFiltered",
+              "flow_name": raw_data_config["hyperlocal_filtered_rpi_impressions_flow_name"],
+              "dataset_name": "rpi_hyperlocal",
+              "initialExec": "5",
+              "minExec": "5",
+              "maxExec": "100",
+              "exec_memory": "5G"},
+    xcom_push=True,
+    provide_context=True )
+
+RpiSalesRevenue = BashOperator(
+    task_id = 'RPISalesRevenue',
+    bash_command=rpi_data_job,
+    dag=dag,
+    params = { "numDays": raw_data_config["rpiNumDays"],
+               "application_name_tag" : application + "RPISalesRevenue",
+               "flow_name": raw_data_config["rpi_sales_preparer_flow_name"],
+               "dataset_name": "rpi",
+               "initialExec": "5",
+               "minExec": "5",
+               "maxExec": "100",
+               "exec_memory": "5G"},
+    xcom_push=True,
+    provide_context=True, retries=1, retry_delay=timedelta(seconds=60), email_on_retry=False)
+
+GrocerySalesRevenue = BashOperator(
+    task_id = 'GroceryRPISalesRevenue',
+    bash_command=rpi_data_job,
+    dag=dag,
+    params = { "numDays": raw_data_config["rpiNumDays"],
+               "application_name_tag" : application + "GroceryRPISalesRevenue",
+               "flow_name": raw_data_config["rpi_sales_preparer_flow_name"],
+               "dataset_name": "rpi_grocery",
+               "initialExec": "5",
+               "minExec": "5",
+               "maxExec": "100",
+               "exec_memory": "8G"},
+    xcom_push=True,
+    provide_context=True )
+
+EmeraldSalesRevenue = BashOperator(
+    task_id = '2GudRPISalesRevenue',
+    bash_command=rpi_data_job,
+    dag=dag,
+    params = { "numDays": raw_data_config["rpiNumDays"],
+               "application_name_tag" : application + "2GudRPISalesRevenue",
+               "flow_name": raw_data_config["rpi_sales_preparer_flow_name"],
+               "dataset_name": "rpi_emerald",
+               "initialExec": "5",
+               "minExec": "5",
+               "maxExec": "100",
+               "exec_memory": "8G"},
+    xcom_push=True,
+    provide_context=True )
+
+HyperlocalSalesRevenue = BashOperator(
+    task_id = 'HyperlocalRPISalesRevenue',
+    bash_command=rpi_data_job,
+    dag=dag,
+    params = { "numDays": raw_data_config["hyperlocalNumDays"],
+               "application_name_tag" : application + "HlRPISalesRevenue",
+               "flow_name": raw_data_config["rpi_sales_preparer_flow_name"],
+               "dataset_name": "rpi_hyperlocal",
+               "initialExec": "5",
+               "minExec": "5",
+               "maxExec": "100",
+               "exec_memory": "5G"},
+    xcom_push=True,
+    provide_context=True )
+
+def trigger_apps(context, dag_run_obj):
+    ti=context["task_instance"]
+    exec_date = context["execution_date"]
+    dag_run_obj.payload = {"exec_date":exec_date }
+    return dag_run_obj
+
+TriggerRpiReport = TriggerDagRunOperator(task_id='TriggerRpiReport', trigger_dag_id="Average_clicks_impressions_dag", python_callable=trigger_apps, dag=dag, provide_context=True)
+
+
+SetJarAndQueue >> RpiDailyClicks >> GroceryDailyClicks >> EmeraldDailyClicks >> HyperlocalDailyClicks
+SetJarAndQueue >> RpiDailyImpressions >> GroceryDailyImpressions >> EmeraldDailyImpressions >> HyperlocalDailyImpressions >> HyperlocalDailyImpressionsFiltered
+SetJarAndQueue >> DailyUniqueFsn >> TriggerRpiReport
+SetJarAndQueue >> RpiSalesRevenue >> GrocerySalesRevenue >> EmeraldSalesRevenue >> HyperlocalSalesRevenue
+SetJarAndQueue >> DailyProductPath >> PrepareProductPath
+RpiDailyClicks >> TriggerRpiReport
+RpiDailyImpressions >> TriggerRpiReport
+RpiSalesRevenue >> TriggerRpiReport
+RpiDailyClicks >> RPICountAgg
+RpiDailyImpressions >> RPICountAgg
+RpiSalesRevenue >> RPICountAgg
+DailyUniqueFsn >> RPICountAgg
