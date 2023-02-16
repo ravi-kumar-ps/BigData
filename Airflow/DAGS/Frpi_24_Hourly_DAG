@@ -1,0 +1,390 @@
+import json
+import logging
+import os
+import shlex
+import sys
+import time
+import urllib2
+from collections import OrderedDict
+from datetime import datetime,timedelta
+from subprocess import PIPE, Popen
+from airflow.operators.sensors import ExternalTaskSensor
+
+from airflow import DAG
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.operators.python_operator import (BranchPythonOperator,
+                                               PythonOperator)
+from airflow.operators.dagrun_operator import TriggerDagRunOperator
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "")))
+import frpi_utils as utils
+
+log = logging.getLogger(__name__)
+
+relative_config_path = "config/frpi/frpi_24_config.json"
+all_config = json.load(open(os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, os.pardir, relative_config_path))), object_pairs_hook=OrderedDict)
+scripts_base_path = "/grid/1/search-data-spyder/bin/airflow/scripts/frpi"
+
+dag = DAG("Frpi_24_Hourly_DAG", description="Frpi 24 hours hourly flow",
+          schedule_interval=all_config["airflow_config"]["schedule_interval"],
+          start_date=datetime(2018, 10, 31), catchup=False, default_args=all_config["airflow_config"]["default_args"])
+
+BRANCH_FLOW_DICT = {
+    'CheckExperimentFlow': {True: 'FreshRPIAggregateComputeExp', False: 'SkipExperimentFlow'}
+}
+CHECK_EXPERIMENT_FLOW_FLAG = "allow_experiment_flow"
+
+def run_spark_command(**kwargs):
+    ti = kwargs["task_instance"]
+    dag_config = ti.xcom_pull(task_ids='SetParams', key='dag_config')
+    jar_location = ti.xcom_pull(task_ids='SetParams', key='jar_location')
+
+    job_name = kwargs["params"]["job_name"]
+
+    job_config = dag_config["config_level_2"][job_name]
+
+    config_bucket_url = dag_config["config_level_0"]["config_bucket_url"]
+    config_bucket = utils.fetch_config_bucket(config_bucket_url)
+
+    queue = config_bucket['queue_name'].strip()
+
+    cmd = "sudo -u fk-hadoop-search /grid/1/search/search-data/spark-2.3.0-bin-hadoop2.7/bin/spark-submit " \
+        "--name {job_name} " \
+        "--class {class_name} " \
+        "--master yarn --queue {queue}  " \
+        "--conf spark.yarn.executor.memoryOverhead={memory_overhead} " \
+        "--conf spark.eventLog.enabled=true " \
+        "--executor-cores {executor_cores} --driver-memory {driver_memory} " \
+        "--executor-memory {executor_memory} --num-executors {num_executors} " \
+        "{extra_spark_args} " \
+        " {jar_location}"
+
+    cmd = cmd.format(
+        job_name=job_name,
+        class_name=job_config['class_name'],
+        queue=queue,
+        memory_overhead=job_config["memory_overhead"],
+        executor_memory=job_config["executor_memory"],
+        executor_cores=job_config["executor_cores"],
+        driver_memory=job_config["driver_memory"],
+        num_executors=job_config["num_executors"],
+        extra_spark_args=job_config.get("extra_spark_args", ""),
+        jar_location=jar_location
+    )
+
+    job_args = job_config["arguments"]
+
+    main_cmd = '%s %s' % (cmd, ' '.join(job_args))
+
+    utils.run_shell_cmd(main_cmd)
+
+
+def prepare_config(config, placeholder_map):
+    """
+    Replace placeholders in config and do level wise replacement
+    """
+    temp_conf = str(config)
+
+    for key, value in placeholder_map.items():
+        placeholder = "${%s}" % key
+        temp_conf = temp_conf.replace(placeholder, value)
+
+    config = eval(temp_conf)
+    index = 0
+    config_level_key_tmpl = "config_level_{index}"
+    config_level_keys = filter(lambda key: key.startswith("config_level_"), sorted(config.keys()))
+
+    # for replacement, we go till second last level
+    for config_level_key in config_level_keys[:-1]:
+        for replace_key, replace_val in config[config_level_key].items():
+            placeholder = "${%s}" % replace_key
+            temp_conf = temp_conf.replace(placeholder, replace_val)
+        config = eval(temp_conf)
+
+    return config
+
+def set_params(**context):
+    ti = context['task_instance']
+
+    time_now = datetime.now()
+    baseDateStr = time_now.strftime("%Y%m%d")
+    baseDateHourStr = time_now.strftime("%Y%m%d%H")
+    factFilterDateHourStr = time_now.strftime("%Y-%m-%d-%H")
+    axon_client_timestamp = str(int(round(time.time() * 1000)))
+    placeholder_map = {
+        "baseDate": baseDateStr,
+        "baseDateHour": baseDateHourStr,
+        "factFilterDateHour" :factFilterDateHourStr,
+        "axon_client_timestamp":axon_client_timestamp,
+        "job_flow_name":"FRPI_24_Hourly"
+    }
+    dag_config = prepare_config(all_config, placeholder_map)
+
+    config_bucket_url = all_config['config_level_0']['config_bucket_url']
+    bucket = utils.fetch_config_bucket(config_bucket_url)
+
+    exp_config_len = len(bucket["freshRpiAggComp.exp_configs"])
+    allow_exp_flow = bucket.get('allow_experiment_flow', False)
+    if exp_config_len > 0 & allow_exp_flow == True:
+        allow_exp_flow = True
+    elif exp_config_len < 0 & allow_exp_flow == True:
+        allow_exp_flow = False
+
+    jar_location = bucket["jar_location"].strip()
+    ti.xcom_push(key="jar_location", value=jar_location)
+    ti.xcom_push(key='dag_config', value=dag_config)
+    ti.xcom_push(key='baseDateStr', value=baseDateStr)
+    ti.xcom_push(key='baseDateHourStr', value=baseDateHourStr)
+    ti.xcom_push(key='allow_frpi_exp_flow', value=allow_exp_flow)
+
+def fetch_fstream_fact_confirmation(**context):
+    """
+    Returns task_id to run based on whether fstream  fact data found or not
+    """
+    ti = context['task_instance']
+    dag_config = ti.xcom_pull(task_ids='SetParams', key='dag_config')
+
+    data_path = dag_config["config_level_2"]["fetch_fstream_fact_confirmation"]["dataPath"]
+    success_path = data_path + "/_SUCCESS"
+
+    exit_code = utils.check_path_exists_in_gcs(success_path)
+    if exit_code == 0:
+        # data found - return FetchFsnItemMappingExp
+        return 'FetchFsnItemMapping'
+    else:
+        # data not found - skip the whole dag
+        return 'SkipCompute'
+
+def prepare_shell_command_for_input_stats_report(**context):
+
+    ti = context['task_instance']
+    base_date_hour_str = ti.xcom_pull(task_ids='SetParams', key='baseDateHourStr')
+    dag_config = ti.xcom_pull(task_ids='SetParams', key='dag_config')
+
+    job_name = context["params"]["job_name"]
+
+    job_config = dag_config["config_level_2"][job_name]
+
+    cmd = "sh {script_location} " \
+            "{base_date_hour} " \
+            "{hdfs_file_url} " \
+            "{emails} " \
+            "{mail_command} "
+
+    runnable_cmd = cmd.format(
+                    script_location = job_config['script_location'],
+                    base_date_hour = base_date_hour_str,
+                    hdfs_file_url = job_config['hdfs_file_url'],
+                    emails = job_config['emails'],
+                    mail_command = job_config['mail_command']
+                  )
+
+    utils.run_shell_cmd(runnable_cmd, True)
+
+
+def check_push_to_axon_enabled(**context):
+    """
+    Returns a task_id to run based on whether push to axon enabled or not
+    """
+    # Fetching the pushToAxonEnabled flag in real time from config service
+    # to enable finer control on push even when the dag has begun
+    # If we had fetched it in the begginging of dag run, then there wouldn't
+    # have been the convenience to toggle push to axon while the dag is running
+    ti = context['task_instance']
+    dag_config = ti.xcom_pull(task_ids='SetParams', key='dag_config')
+    config_bucket_url = dag_config["config_level_0"]["config_bucket_url"]
+    config_bucket = utils.fetch_config_bucket(config_bucket_url)
+    push_to_axon_enabled = config_bucket.get('push_to_axon_enabled', False)
+    if push_to_axon_enabled:
+        return 'PushToAxonFsns'
+    else:
+        return 'SkipAxonPush'
+
+def check_push_to_debug(**context):
+    """
+    Returns a task_id (either PushToDebug or SkipDebugPush)
+    based on 2 criteria - push_to_debug_enabled flag and push at select
+    intervals
+    """
+    # Fetching the push_to_debug_enabled flag in real time from config service
+    # to enable finer control on push even when the dag has begun
+    # If we had fetched it in the begginging of dag run, then there wouldn't
+    # have been the convenience to toggle push to debug while the dag is running
+    ti = context['task_instance']
+    dag_config = ti.xcom_pull(task_ids='SetParams', key='dag_config')
+    config_bucket_url = dag_config["config_level_0"]["config_bucket_url"]
+    config_bucket = utils.fetch_config_bucket(config_bucket_url)
+    push_to_debug_enabled = config_bucket.get('push_to_debug_enabled', False)
+
+    ti = context['task_instance']
+    baseDateHourStr = ti.xcom_pull(task_ids='SetParams', key='baseDateHourStr')
+    hour = int(baseDateHourStr[-2:])
+    if (hour % 3) == 0 and push_to_debug_enabled:
+        return 'PushToDebug'
+    else:
+        return 'SkipDebugPush'
+
+def check_experiment_flow(**context):
+    ti = context['task_instance']
+    flag_dict = context["params"]["flag_dict"]
+    allow_exp_flow = ti.xcom_pull(task_ids='SetParams', key='allow_frpi_exp_flow')
+    if allow_exp_flow is not None and not allow_exp_flow:
+        return flag_dict[allow_exp_flow]
+    else:
+        return utils.branch_flow_helper(**context)
+
+SetParams = PythonOperator(
+    task_id='SetParams', provide_context=True,
+    python_callable=set_params, dag=dag
+)
+
+
+FetchFstreamFactData = PythonOperator(
+    task_id='FetchFstreamFactData',
+    dag=dag,
+    provide_context=True,
+    python_callable=run_spark_command,
+    params={'job_name': 'fetch_fact_data'},
+    retries=50, retry_delay=timedelta(seconds=60), email_on_retry=False
+)
+
+SendInputStatsReport = PythonOperator(
+    task_id='SendInputStatsReport',
+    dag=dag,
+    provide_context=True,
+    python_callable=prepare_shell_command_for_input_stats_report,
+    params={'job_name': 'input_stats_reporter'}
+)
+
+SkipCompute = DummyOperator(
+    task_id='SkipCompute',
+    dag=dag
+)
+
+FetchFstreamFactConfirmation = BranchPythonOperator(
+    python_callable=fetch_fstream_fact_confirmation,
+    task_id='FetchFstreamFactConfirmation',
+    provide_context=True,
+    dag=dag
+)
+
+FetchFsnItemMapping = PythonOperator(
+    task_id = 'FetchFsnItemMapping',
+    dag=dag,
+    provide_context=True,
+    python_callable=run_spark_command,
+    params={'job_name': 'fetch_fsn_item_mapping'}
+)
+
+CheckExperimentFlowNode = BranchPythonOperator(
+    task_id='CheckExperimentFlow',
+    python_callable=check_experiment_flow,
+    params={'flag_key': CHECK_EXPERIMENT_FLOW_FLAG, 'flag_dict': BRANCH_FLOW_DICT['CheckExperimentFlow']},
+    provide_context=True,
+    dag=dag
+)
+
+SkipExperimentFlow = DummyOperator(
+    task_id='SkipExperimentFlow',
+    dag=dag
+)
+
+FreshRPIAggregateComputeProd = PythonOperator(
+    task_id = 'FreshRPIAggregateComputeProd',
+    dag=dag,
+    provide_context=True,
+    python_callable=run_spark_command,
+    params={'job_name': 'fresh_rpi_aggregate_compute_prod'}
+)
+
+FreshRPIAggregateComputeExp = PythonOperator(
+    task_id = 'FreshRPIAggregateComputeExp',
+    dag=dag,
+    provide_context=True,
+    python_callable=run_spark_command,
+    params={'job_name': 'fresh_rpi_aggregate_compute_exp'}
+)
+
+MergePayloads = PythonOperator(
+    task_id= 'MergePayloads',
+    dag=dag,
+    provide_context=True,
+    python_callable=run_spark_command,
+    params={'job_name': 'merge_payloads'},
+    trigger_rule="all_done"
+)
+
+PushToAxonFsns = PythonOperator(
+    task_id= 'PushToAxonFsns',
+    dag=dag,
+    provide_context=True,
+    python_callable=run_spark_command,
+    params={'job_name': 'push_to_axon_fsns'}
+)
+
+def passing_execution_date_to_external_dag(context, dag_run_obj):
+    execution_date = context["execution_date"]
+    dag_run_obj.payload = {"execution_date": execution_date}
+    return dag_run_obj
+
+seeding_pipeline_trigger = TriggerDagRunOperator(
+    task_id='SeedingPipelineTrigger',
+    trigger_dag_id='Seeding_dag',
+    reset_dag_run=True,
+    provide_context=True,
+    python_callable= passing_execution_date_to_external_dag,
+    dag=dag
+)
+
+
+CheckPushToDebug = BranchPythonOperator(
+    task_id='CheckPushToDebug',
+    python_callable=check_push_to_debug,
+    provide_context=True,
+    dag=dag
+)
+
+PushToDebug = PythonOperator(
+    task_id= 'PushToDebug',
+    dag=dag,
+    provide_context=True,
+    python_callable=run_spark_command,
+    params={'job_name': 'push_to_debug'}
+)
+
+SkipDebugPush = DummyOperator(
+    task_id='SkipDebugPush',
+    dag=dag
+)
+
+CheckPushToAxon = BranchPythonOperator(
+    task_id='CheckPushToAxon',
+    python_callable=check_push_to_axon_enabled,
+    provide_context=True,
+    dag=dag
+)
+
+SkipAxonPush = DummyOperator(
+    task_id='SkipAxonPush',
+    dag=dag
+)
+
+EndDAGRun = DummyOperator(
+    task_id='EndDAGRun',
+    dag=dag
+)
+
+
+SetParams >> FetchFstreamFactData >> FetchFstreamFactConfirmation
+FetchFstreamFactConfirmation >> FetchFsnItemMapping
+FetchFsnItemMapping >> FreshRPIAggregateComputeProd >> MergePayloads
+FetchFsnItemMapping >> CheckExperimentFlowNode >> SkipExperimentFlow >> MergePayloads
+CheckExperimentFlowNode >> FreshRPIAggregateComputeExp >> MergePayloads
+FetchFstreamFactConfirmation >> SkipCompute >> EndDAGRun
+FetchFsnItemMapping >> SendInputStatsReport
+MergePayloads >> CheckPushToAxon
+CheckPushToAxon >> PushToAxonFsns >> CheckPushToDebug >> PushToDebug >> EndDAGRun
+CheckPushToDebug >> SkipDebugPush >> EndDAGRun
+CheckPushToAxon >> SkipAxonPush >> EndDAGRun
+PushToAxonFsns >> seeding_pipeline_trigger
